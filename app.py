@@ -1,26 +1,29 @@
+import zipfile
+import streamlit as st
 import cv2
-import face_recognition
 import numpy as np
 import os
-from shutil import copyfile
+import face_recognition
 from openpyxl import Workbook, load_workbook
-import onnxruntime as ort
-import streamlit as st
 from PIL import Image
-from io import BytesIO
+import tempfile
+import onnxruntime as ort
+import io
+from datetime import datetime
 
-# Path to the custom ONNX model
+# Paths
 model_path = 'MODEL12/weights/best.onnx'
-session = ort.InferenceSession(model_path)
-
-# Excel file path
 excel_path = 'face_detection_log.xlsx'
-
-# Global variable for face encodings dictionary
 face_encodings_dict = {}
 
+# Load model
+@st.cache_resource
+def load_model():
+    return ort.InferenceSession(model_path)
+
+session = load_model()
+
 def create_excel_sheet():
-    # Create a new Excel workbook and sheet if it doesn't exist
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = 'Face Detection Log'
@@ -28,107 +31,112 @@ def create_excel_sheet():
     workbook.save(excel_path)
 
 def update_excel_sheet(face_name, image_path):
-    # Load the existing workbook
+    if not os.path.exists(excel_path):
+        create_excel_sheet()
     workbook = load_workbook(excel_path)
     sheet = workbook.active
-    # Append the new face name and image path
     sheet.append([face_name, image_path])
     workbook.save(excel_path)
 
 def preprocess(image):
     image = cv2.resize(image, (640, 640))
-    image = image.transpose(2, 0, 1)  # HWC to CHW
-    image = np.expand_dims(image, axis=0)
-    image = image.astype(np.float32)
-    image /= 255.0  # Normalize to [0, 1]
+    image = image.transpose(2, 0, 1)
+    image = np.expand_dims(image, axis=0).astype(np.float32) / 255.0
     return image
 
-def non_max_suppression(boxes, scores, iou_threshold):
-    indices = cv2.dnn.NMSBoxes(boxes, scores, score_threshold=0.25, nms_threshold=iou_threshold)
+def non_max_suppression(boxes, scores, iou_threshold=0.4):
+    indices = cv2.dnn.NMSBoxes(boxes, scores, 0.25, iou_threshold)
     return indices.flatten() if len(indices) > 0 else []
 
-def postprocess(outputs, image_shape, input_shape, iou_threshold=0.4):
+def postprocess(outputs, image_shape, input_shape):
     boxes, scores, class_ids = [], [], []
     for output in outputs:
         for det in output:
-            if det[4] > 0.25:  # Confidence threshold
-                x_center, y_center, width, height = det[0], det[1], det[2], det[3]
+            if det[4] > 0.25:
+                x_center, y_center, width, height = det[:4]
                 left = int((x_center - width / 2) * (image_shape[1] / input_shape[3]))
                 top = int((y_center - height / 2) * (image_shape[0] / input_shape[2]))
                 right = int((x_center + width / 2) * (image_shape[1] / input_shape[3]))
-                bottom = int((x_center + height / 2) * (image_shape[0] / input_shape[2]))
+                bottom = int((y_center + height / 2) * (image_shape[0] / input_shape[2]))
                 boxes.append([left, top, right, bottom])
                 scores.append(det[4])
                 class_ids.append(int(det[5]))
+    indices = non_max_suppression(boxes, scores)
+    return [boxes[i] for i in indices], [scores[i] for i in indices], [class_ids[i] for i in indices]
 
-    indices = non_max_suppression(boxes, scores, iou_threshold)
-    filtered_boxes = [boxes[i] for i in indices]
-    filtered_scores = [scores[i] for i in indices]
-    filtered_class_ids = [class_ids[i] for i in indices]
-
-    return filtered_boxes, filtered_scores, filtered_class_ids
-
-def detect_and_recognize_faces(image):
+def detect_faces(image):
     input_image = preprocess(image)
     outputs = session.run(None, {session.get_inputs()[0].name: input_image})
     boxes, scores, class_ids = postprocess(outputs[0], image.shape, input_image.shape)
-    
-    face_locations = []
-    for box, score, class_id in zip(boxes, scores, class_ids):
-        if class_id == 0:
-            face_locations.append((box[1], box[2], box[3], box[0]))
-
+    face_locations = [(box[1], box[2], box[3], box[0]) for box, cid in zip(boxes, class_ids) if cid == 0]
     rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
-    
-    return face_locations, face_encodings
+    return face_locations, face_encodings, image
 
-def display_faces_with_boxes(image, face_locations):
-    for (top, right, bottom, left) in face_locations:
-        cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)
-    return image
+def process_image(image, image_name, output_folder):
+    global face_encodings_dict
+    face_locations, face_encodings, original = detect_faces(image)
+    for idx, (encoding, (top, right, bottom, left)) in enumerate(zip(face_encodings, face_locations)):
+        match_found = False
+        for name, encodings in face_encodings_dict.items():
+            if True in face_recognition.compare_faces(encodings, encoding):
+                match_found = True
+                folder_path = os.path.join(output_folder, name)
+                os.makedirs(folder_path, exist_ok=True)
+                cv2.imwrite(os.path.join(folder_path, image_name), original)
+                update_excel_sheet(name, os.path.join(folder_path, image_name))
+                break
+        if not match_found:
+            face_image = original[top:bottom, left:right]
+            if face_image is None or face_image.size == 0:
+                st.warning(f"Skipped an empty or invalid face crop in image: {image_name}")
+                continue
+            face_pil = Image.fromarray(cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB))
+            st.image(face_pil, caption="New Face Detected")
+            unique_key = f"{image_name}_{top}_{right}_{bottom}_{left}_{idx}"
+            name = st.text_input(f"Enter name for face in {image_name} (face #{idx+1}):", key=unique_key)
+        if name:
+                face_encodings_dict[name] = [encoding]
+                folder_path = os.path.join(output_folder, name)
+                os.makedirs(folder_path, exist_ok=True)
+                cv2.imwrite(os.path.join(folder_path, image_name), original)
+                update_excel_sheet(name, os.path.join(folder_path, image_name))
 
-def main():
-    st.title("Real-Time Face Recognition")
-    
-    # Sidebar options
-    st.sidebar.title("Options")
-    option = st.sidebar.radio("Choose Mode", ("Upload Image", "Use Webcam"))
-    
-    if option == "Upload Image":
-        uploaded_file = st.file_uploader("Upload an Image", type=["jpg", "jpeg", "png"])
-        if uploaded_file is not None:
-            image = Image.open(uploaded_file)
-            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            face_locations, face_encodings = detect_and_recognize_faces(image)
+st.title("📸 Face Detection & Organization")
 
-            if face_locations:
-                annotated_image = display_faces_with_boxes(image.copy(), face_locations)
-                st.image(annotated_image, channels="BGR", caption="Detected Faces")
-            else:
-                st.warning("No faces detected!")
-    
-    elif option == "Use Webcam":
-        run_webcam = st.button("Start Webcam")
-        if run_webcam:
-            capture = cv2.VideoCapture(0)
-            stframe = st.empty()
-            while True:
-                ret, frame = capture.read()
-                if not ret:
-                    break
+option = st.radio("Choose Input Method", ["Upload ZIP Folder", "Capture via Webcam"])
 
-                face_locations, face_encodings = detect_and_recognize_faces(frame)
+if option == "Upload ZIP Folder":
+    uploaded_zip = st.file_uploader("Upload a ZIP file with images", type="zip")
+    if uploaded_zip:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zip_path = os.path.join(tmpdir, "images.zip")
+            with open(zip_path, "wb") as f:
+                f.write(uploaded_zip.read())
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(tmpdir)
+            output_dir = os.path.join(tmpdir, "sorted_faces")
+            os.makedirs(output_dir, exist_ok=True)
+            for root, dirs, files in os.walk(tmpdir):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        img_path = os.path.join(root, file)
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            process_image(img, file, output_dir)
+            st.success("All images processed!")
+            if os.path.exists(excel_path):
+                with open(excel_path, "rb") as f:
+                    st.download_button("Download Log File", f, file_name="face_detection_log.xlsx")
 
-                if face_locations:
-                    frame = display_faces_with_boxes(frame, face_locations)
-
-                stframe.image(frame, channels="BGR")
-
-                if st.button("Stop Webcam"):
-                    capture.release()
-                    stframe.empty()
-                    break
-
-if __name__ == "__main__":
-    main()
+if option == "Capture via Webcam":
+    frame = st.camera_input("Take a picture")
+    if frame is not None:
+        image = Image.open(frame)
+        img_array = np.array(image.convert('RGB'))[:, :, ::-1]  # RGB to BGR
+        temp_name = f"webcam_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        process_image(img_array, temp_name, "captured_faces")
+        st.success("Webcam image processed!")
+        if os.path.exists(excel_path):
+            with open(excel_path, "rb") as f:
+                st.download_button("Download Log File", f, file_name="face_detection_log.xlsx")
